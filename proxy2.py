@@ -61,9 +61,6 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
         self.log_message(format, *args)
 
     def do_CONNECT(self):
-        if os.path.isfile(self.cakey) and os.path.isfile(self.cacert) and os.path.isfile(self.certkey) and os.path.isdir(self.certdir):
-            self.connect_intercept()
-        else:
             self.connect_relay()
 
     def connect_intercept(self):
@@ -91,15 +88,34 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
             self.close_connection = 1
 
     def connect_relay(self):
+        if "marketplacesut-du.dev.hpedevops.net:443" == self.path:
+            self.path = "172.18.202.73:9999"
+        elif "marketplacesut-du-eu-west-1.dev.hpedevops.net:443" == self.path:
+            self.path = "172.18.202.73:9998"
+        elif "marketplacesut-du-vmwarezonebg-ncs.dev.hpedevops.net:443" == self.path:
+            self.path = "172.18.202.73:9997"
+
         address = self.path.split(':', 1)
         address[1] = int(address[1]) or 443
-        try:
-            s = socket.create_connection(address, timeout=self.timeout)
-        except Exception as e:
-            self.send_error(502)
-            return
-        self.send_response(200, 'Connection Established')
-        self.end_headers()
+
+        if address[0] == "172.18.202.73":
+            try:
+                s = socket.create_connection(address, timeout=self.timeout)
+            except Exception as e:
+                self.send_error(502)
+                return
+            self.send_response(200, 'Connection Established')
+            self.end_headers()
+        else:
+            try:
+                s = socket.create_connection(("172.18.192.4", 8080), timeout=self.timeout)
+            except Exception as e:
+                self.send_error(502)
+                return
+            head = '\r\n'.join('%s: %s' % (k, v) for (k, v) in self.headers.items()) + '\r\n\r\n'
+            connect = 'CONNECT {}:{} HTTP/1.0\r\n'.format(address[0], address[1])
+            s.send(connect)
+            s.send(head)
 
         conns = [self.connection, s]
         self.close_connection = 0
@@ -109,16 +125,19 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
                 break
             for r in rlist:
                 other = conns[1] if r is conns[0] else conns[0]
-                data = r.recv(8192)
+                data = r.recv()
                 if not data:
                     self.close_connection = 1
                     break
                 other.sendall(data)
 
     def do_GET(self):
-        if self.path == 'http://proxy2.test/':
-            self.send_cacert()
-            return
+        if "marketplacesut-du.dev.hpedevops.net" in self.path:
+            self.path = self.path.replace("marketplacesut-du.dev.hpedevops.net", "172.18.202.73:9999")
+        elif "marketplacesut-du-eu-west-1.dev.hpedevops.net" in self.path:
+            self.path = self.path.replace("marketplacesut-du-eu-west-1.dev.hpedevops.net", "172.18.202.73:9998")
+        elif "marketplacesut-du-vmwarezonebg-ncs.dev.hpedevops.net" in self.path:
+            self.path = self.path.replace("marketplacesut-du-vmwarezonebg-ncs.dev.hpedevops.net", "172.18.202.73:9997")
 
         req = self
         content_length = int(req.headers.get('Content-Length', 0))
@@ -149,9 +168,13 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
             origin = (scheme, netloc)
             if not origin in self.tls.conns:
                 if scheme == 'https':
-                    self.tls.conns[origin] = httplib.HTTPSConnection(netloc, timeout=self.timeout)
+                    self.tls.conns[origin] = httplib.HTTPSConnection("172.18.192.4","8080", timeout=self.timeout)
+                    self.tls.conns[origin].set_tunnel(netloc)
                 else:
-                    self.tls.conns[origin] = httplib.HTTPConnection(netloc, timeout=self.timeout)
+                    if "172.18.202.73" in req.path:
+                        self.tls.conns[origin] = httplib.HTTPConnection(netloc, timeout=self.timeout)
+                    else: 
+                        self.tls.conns[origin] = httplib.HTTPConnection("172.18.192.4","8080", timeout=self.timeout)
             conn = self.tls.conns[origin]
             conn.request(self.command, path, req_body, dict(req.headers))
             res = conn.getresponse()
@@ -165,12 +188,11 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
                 self.response_handler(req, req_body, res, '')
                 setattr(res, 'headers', self.filter_headers(res.headers))
                 self.relay_streaming(res)
-                with self.lock:
-                    self.save_handler(req, req_body, res, '')
                 return
 
             res_body = res.read()
         except Exception as e:
+            print e
             if origin in self.tls.conns:
                 del self.tls.conns[origin]
             self.send_error(502)
@@ -197,9 +219,6 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
         self.wfile.write(res_body)
         self.wfile.flush()
 
-        with self.lock:
-            self.save_handler(req, req_body, res, res_body_plain)
-
     def relay_streaming(self, res):
         self.wfile.write("%s %d %s\r\n" % (self.protocol_version, res.status, res.reason))
         for line in res.headers.headers:
@@ -207,7 +226,7 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
         self.end_headers()
         try:
             while True:
-                chunk = res.read(8192)
+                chunk = res.read()
                 if not chunk:
                     break
                 self.wfile.write(chunk)
@@ -221,6 +240,7 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
     do_PUT = do_GET
     do_DELETE = do_GET
     do_OPTIONS = do_GET
+    do_PATCH = do_GET
 
     def filter_headers(self, headers):
         # http://tools.ietf.org/html/rfc2616#section-13.5.1
@@ -364,7 +384,7 @@ class ProxyRequestHandler(BaseHTTPRequestHandler):
         pass
 
     def save_handler(self, req, req_body, res, res_body):
-        self.print_info(req, req_body, res, res_body)
+        pass
 
 
 def test(HandlerClass=ProxyRequestHandler, ServerClass=ThreadingHTTPServer, protocol="HTTP/1.1"):
@@ -372,7 +392,7 @@ def test(HandlerClass=ProxyRequestHandler, ServerClass=ThreadingHTTPServer, prot
         port = int(sys.argv[1])
     else:
         port = 8080
-    server_address = ('::1', port)
+    server_address = ('', port)
 
     HandlerClass.protocol_version = protocol
     httpd = ServerClass(server_address, HandlerClass)
